@@ -1,0 +1,10 @@
+[package]
+name = "nelder_mead_rs"
+version = "0.1.0"
+authors = ["shubhamck <shubham.khilari02@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+assert_approx_eq = "1.1.0"
