@@ -1,2 +1,2 @@
-langauge: rust
+language: rust
 cache: cargo
