@@ -1,3 +1,5 @@
+extern crate num;
+
 fn get_unit_vector(initial_guess: &[f64]) -> Vec<f64> {
     // get the norm
     let sq_norm: f64 = initial_guess.iter().map(|x| x * x).sum();
@@ -103,6 +105,49 @@ fn shrinkage_contraction(sorted_simplex: &mut Vec<Vec<f64>>, shrinkage_contracti
     }
 }
 
+fn transform_from_normalized_space(
+    sample: &[f64],
+    lower_bounds: &[f64],
+    upper_bounds: &[f64],
+) -> Vec<f64> {
+    const ZERO_OFFSET: f64 = 1.0e-10;
+    let mut normalized_sample = vec![0.0; sample.len()];
+    for i in 0..sample.len() {
+        let lower_bound = if lower_bounds[i] <= std::f64::EPSILON {
+            ZERO_OFFSET
+        } else {
+            lower_bounds[i]
+        };
+        let upper_bound = upper_bounds[i];
+        let state = sample[i];
+        let transformed_state =
+            ((state.sin() + 1.0) * (upper_bound - lower_bound)) / 2.0 + lower_bound;
+        normalized_sample[i] = num::clamp(transformed_state, lower_bound, upper_bound);
+    }
+    normalized_sample
+}
+
+fn transform_to_normalized_space(
+    sample: &[f64],
+    lower_bounds: &[f64],
+    upper_bounds: &[f64],
+) -> Vec<f64> {
+    let mut normalized_sample = vec![1.0; sample.len()];
+    for i in 0..sample.len() {
+        let state = sample[i];
+        if state >= upper_bounds[i] {
+            normalized_sample[i] = std::f64::consts::FRAC_PI_2;
+        } else if state <= lower_bounds[i] {
+            normalized_sample[i] = -std::f64::consts::FRAC_PI_2;
+        } else {
+            let s = 2.0 * (state - lower_bounds[i]) / (upper_bounds[i] - lower_bounds[i]) - 1.0;
+            let clamped_s = num::clamp(s, -1.0, 1.0);
+            normalized_sample[i] = std::f64::consts::PI * 2.0 + clamped_s.asin();
+        }
+    }
+    normalized_sample
+}
+
 pub fn nelder_mead_solve(cost_function: &dyn Fn(&[f64]) -> f64, initial_guess: &[f64]) -> Vec<f64> {
     let mut initial_simplex = get_initial_simplex(initial_guess);
     let num_samples = initial_simplex.len();
@@ -185,6 +230,106 @@ pub fn nelder_mead_solve(cost_function: &dyn Fn(&[f64]) -> f64, initial_guess: &
     return initial_simplex[0].clone();
 }
 
+pub fn nelder_mead_solve_constrained(
+    cost_function: &dyn Fn(&[f64]) -> f64,
+    initial_guess: &[f64],
+    lower_bounds: &[f64],
+    upper_bounds: &[f64],
+) -> Vec<f64> {
+    let transformed_initial_guess =
+        transform_to_normalized_space(initial_guess, lower_bounds, upper_bounds);
+    let transformed_cost_function = |x: &[f64]| -> f64 {
+        let transformed_state = transform_from_normalized_space(x, lower_bounds, upper_bounds);
+        cost_function(&transformed_state)
+    };
+    let mut initial_simplex = get_initial_simplex(&transformed_initial_guess);
+    let num_samples = initial_simplex.len();
+    let best_index: usize = 0;
+    let worst_index: usize = num_samples - 1;
+    let second_worst_index: usize = num_samples - 2;
+    let mut iter = 0;
+    const MAX_ITER: usize = 5000;
+    const REFLECTION_FACTOR: f64 = 1.0;
+    const EXPANSION_FACTOR: f64 = 2.0;
+    const CONTRACTION_FACTOR: f64 = 0.5;
+    const SHRINKAGE_CONTRACTION_FACTOR: f64 = 0.5;
+    const BEST_COST_THRESHOLD: f64 = 1.0e-9;
+
+    loop {
+        let mut costs = calculate_costs(&initial_simplex, &transformed_cost_function);
+
+        // get centroid
+        reorder(&mut initial_simplex, &mut costs);
+        let best_cost = costs[best_index];
+        let worst_cost = costs[worst_index];
+        let second_worst_cost = costs[second_worst_index];
+        if best_cost.abs() < BEST_COST_THRESHOLD {
+            return transform_from_normalized_space(
+                &initial_simplex[0].clone(),
+                lower_bounds,
+                upper_bounds,
+            );
+        }
+
+        let centroid = calculate_centroid(&initial_simplex[..num_samples - 1]);
+
+        // get reflected worst point
+        let reflected_point =
+            calculate_reflected_point(&centroid, &initial_simplex[worst_index], REFLECTION_FACTOR);
+
+        let reflected_point_cost = transformed_cost_function(&reflected_point);
+
+        // Three cases
+        // 1. reflected cost is better than the best cost -> calculate_expanded_point
+        // 2. reflected cost is better than second worst cost -> replace worst point wth reflected
+        //    point
+        // 3. reflected cost is worst than current worst
+        if reflected_point_cost < best_cost {
+            // reflected point is better than best point
+            let expanded_point =
+                calculate_expanded_point(&centroid, &reflected_point, EXPANSION_FACTOR);
+            // replace worst point with better of reflected_point or expanded point
+            let expanded_point_cost = transformed_cost_function(&expanded_point);
+
+            if expanded_point_cost < reflected_point_cost {
+                initial_simplex[worst_index] = expanded_point;
+            } else {
+                initial_simplex[worst_index] = reflected_point;
+            }
+        } else if reflected_point_cost < second_worst_cost {
+            // reflected point is worst than best but better than second worst
+            initial_simplex[worst_index] = reflected_point;
+        } else if reflected_point_cost < worst_cost {
+            // reflected point is worse than second worst but better than worst
+            let contracted_point = calculate_contracted_point(
+                &centroid,
+                &initial_simplex[worst_index],
+                CONTRACTION_FACTOR,
+            );
+
+            let contracted_point_cost = transformed_cost_function(&contracted_point);
+            if contracted_point_cost < worst_cost {
+                // contracted point is better than worst
+                initial_simplex[worst_index] = contracted_point;
+            } else {
+                shrinkage_contraction(&mut initial_simplex, SHRINKAGE_CONTRACTION_FACTOR);
+            }
+        } else {
+            shrinkage_contraction(&mut initial_simplex, SHRINKAGE_CONTRACTION_FACTOR);
+        }
+
+        iter += 1;
+
+        if iter > MAX_ITER {
+            break;
+        }
+    }
+    return transform_from_normalized_space(
+        &initial_simplex[0].clone(),
+        lower_bounds,
+        upper_bounds,
+    );
+}
 #[cfg(test)]
 mod tests {
 
@@ -197,6 +342,7 @@ mod tests {
     use super::get_initial_simplex;
     use super::get_unit_vector;
     use super::nelder_mead_solve;
+    use super::nelder_mead_solve_constrained;
     use super::reorder;
     use super::shrinkage_contraction;
     use assert_approx_eq::assert_approx_eq;
@@ -211,7 +357,6 @@ mod tests {
             s
         };
         let initial_guess = vec![3.0, 4.0];
-        // assert_eq!(nelder_mead_solve(&f, &initial_guess), [0.0, 0.0]);
         let solution = nelder_mead_solve(&f, &initial_guess);
         let expected_solution = vec![0.0, 0.0];
         for i in 0..initial_guess.len() {
@@ -219,6 +364,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_contrained_solve() {
+        let f = |v: &[f64]| -> f64 {
+            let mut s = 0.0;
+            for x in v {
+                s += x.powi(2);
+            }
+            s
+        };
+        let initial_guess = vec![3.0, 4.0];
+        let lower_bounds = vec![1.0, 1.0];
+        let upper_bounds = vec![100.0, 100.0];
+        let solution =
+            nelder_mead_solve_constrained(&f, &initial_guess, &lower_bounds, &upper_bounds);
+        let expected_solution = vec![1.0, 1.0];
+        for i in 0..initial_guess.len() {
+            assert_approx_eq!(solution[i], expected_solution[i], 0.001);
+        }
+    }
     #[test]
     fn test_unit_vector() {
         let vector = vec![3.0, 4.0];
@@ -302,6 +466,13 @@ mod tests {
             vec![vec![3.0, 4.0], vec![4.0, 5.0], vec![2.0, 3.0]]
         )
     }
+
+    // #[test]
+    // fn test_transform_to_normalized_space() {
+    //     let lower_bounds = vec![5.0, 5.0];
+    //     let upper_bounds = vec![0.0, 0.0];
+    //     let in_sample = vec![3.0, 4.0];
+    // }
 
     #[test]
     fn test_rosenbrock() {
